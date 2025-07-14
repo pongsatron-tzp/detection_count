@@ -251,9 +251,25 @@ async def generate_video_frames():
 async def main_page():
     html_content = """
     <html><head><title>Face Detection Stream</title>
-    <style>body{font-family:sans-serif;background-color:#282c34;color:white;margin:0;padding:20px;text-align:center}h1{color:#61dafb}#video-stream{border:2px solid #61dafb;border-radius:8px;max-width:90%;height:auto}.info{margin-top:20px;font-size:1.2em}a{color:#61dafb}</style></head>
-    <body><h1>Live Face Detection Stream</h1><img id="video-stream" src="/video_feed" alt="Video Stream">
-    <div class="info"><p>API Endpoints:</p><p><a href="/docs" target="_blank">/docs</a> - API Docs</p><p><a href="/status" target="_blank">/status</a> - Get Status</p><p><a href="/faces" target="_blank">/faces</a> - List Faces</p></div></body></html>
+    <style>
+        body { font-family: sans-serif; background-color: #282c34; color: white; margin: 0; padding: 20px; text-align: center; } 
+        h1 { color: #61dafb; } 
+        #video-stream { border: 2px solid #61dafb; border-radius: 8px; max-width: 90%; height: auto; } 
+        .info { margin-top: 20px; font-size: 1.2em; } 
+        a { color: #61dafb; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        p { margin: 8px 0; }
+    </style></head>
+    <body>
+        <h1>Live Face Detection Stream</h1>
+        <img id="video-stream" src="/video_feed" alt="Video Stream">
+        <div class="info">
+            <p><strong>API Endpoints:</strong></p>
+            <p><a href="/docs" target="_blank">/docs</a> &mdash; Interactive API Documentation</p>
+            <p><a href="/status" target="_blank">/status</a> &mdash; Get current detection status</p>
+            <p><a href="/faces" target="_blank">/faces</a> &mdash; List all saved face files</p>
+        </div>
+    </body></html>
     """
     return Response(content=html_content, media_type="text/html")
 
