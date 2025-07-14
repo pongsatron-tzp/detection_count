@@ -5,106 +5,129 @@ import numpy as np
 import os
 import datetime
 import asyncio
+import logging
+import pickle
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic_settings import BaseSettings
+from dataclasses import dataclass, field
+from typing import List, Any, Tuple, Dict
 import uvicorn
 
-# --- Global Configuration and State ---
-SAVE_DIR = "detected_faces"
-# สถานะที่ใช้ร่วมกันระหว่าง FastAPI app และ Background task
-current_known_face_encodings = []
-current_known_faces_count = 0
-current_last_saved_person_encoding = None
-current_last_saved_person_cooldown_active = False
-current_last_saved_person_seen_time = 0
-# [สตรีมมิ่ง] ตัวแปรสำหรับเก็บเฟรมล่าสุดเพื่อสตรีม
-current_frame_with_boxes = None
-# การตั้งค่า Cooldown และ Threshold
-COOLDOWN_TIMEOUT_IF_NOT_SEEN = 3
-DETECTION_THRESHOLD = 0.73 # ค่านี้ค่อนข้างผ่อนปรน อาจทำให้ทักคนผิดได้ง่าย
-# ตัวควบคุมสำหรับ Background task
+# --- Configuration ---
+class Settings(BaseSettings):
+    CAMERA_INDEX: int = 0
+    SAVE_DIR: str = "detected_faces"
+    KNOWN_ENCODINGS_FILE: str = "known_faces.pkl"
+    DETECTION_THRESHOLD: float = 0.70
+    PROCESS_EVERY_N_FRAME: int = 2
+    RECENTLY_SEEN_TIMEOUT: int = 10
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- State Management ---
+@dataclass
+class AppState:
+    known_face_encodings: List[np.ndarray] = field(default_factory=list)
+    recently_seen_unknowns: Dict[tuple, float] = field(default_factory=dict)
+    frame_with_boxes: Any = None
+    
+    @property
+    def known_faces_count(self) -> int:
+        return len(self.known_face_encodings)
+
+app_state = AppState()
+
+# --- Global Controls ---
 _camera_capture = None
 _detection_task = None
 _stop_detection_flag = asyncio.Event()
-_executor = ThreadPoolExecutor(max_workers=2)
+_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 2)
 
-# [บันทึกภาพ] ฟังก์ชันใหม่สำหรับบันทึกใบหน้า
-def save_new_face(frame, face_location):
-    """
-    ตัดภาพเฉพาะส่วนใบหน้าจากเฟรมและบันทึกเป็นไฟล์ .jpg
-    """
+# --- Helper Functions ---
+def save_new_face(frame: np.ndarray, face_location: tuple):
     try:
-        # ดึงตำแหน่งของใบหน้า (top, right, bottom, left)
         top, right, bottom, left = face_location
-        
-        # ขยายกรอบเล็กน้อยเพื่อให้ได้ภาพใบหน้าที่สมบูรณ์ขึ้น (เผื่อผมหรือคาง)
         padding = 30
         top = max(0, top - padding)
         left = max(0, left - padding)
         bottom = min(frame.shape[0], bottom + padding)
         right = min(frame.shape[1], right + padding)
         
-        # ตัดภาพใบหน้า (crop)
         face_image = frame[top:bottom, left:right]
-
-        # สร้างชื่อไฟล์ที่ไม่ซ้ำกันโดยใช้วันที่และเวลา
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = os.path.join(SAVE_DIR, f"face_{timestamp}.jpg")
-        
-        # ตรวจสอบว่าภาพที่ตัดมาไม่เล็กเกินไป
         if face_image.size == 0:
-            print(f"[บันทึกภาพ] คำเตือน: ไม่สามารถบันทึกภาพได้เนื่องจากขนาดภาพเป็น 0 (อาจจะอยู่นอกขอบเฟรม)")
+            logger.warning("Cropped face image has zero size, skipping save.")
             return
 
-        # บันทึกไฟล์ภาพ
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = os.path.join(settings.SAVE_DIR, f"face_{timestamp}.jpg")
         cv2.imwrite(filename, face_image)
-        print(f"[บันทึกภาพ] บันทึกใบหน้าใหม่เรียบร้อยแล้วที่: {filename}")
-        
+        logger.info(f"Saved new face to: {filename}")
     except Exception as e:
-        print(f"[บันทึกภาพ] เกิดข้อผิดพลาดในการบันทึกภาพใบหน้า: {e}")
+        logger.error(f"Error saving new face: {e}")
 
-# --- Helper Functions ---
-def setup_save_directory():
-    if not os.path.exists(SAVE_DIR):
-        os.makedirs(SAVE_DIR)
-        print(f"[Setup] สร้างไดเรกทอรี: '{SAVE_DIR}'")
+def _invalidate_encoding_cache():
+    if os.path.exists(settings.KNOWN_ENCODINGS_FILE):
+        try:
+            os.remove(settings.KNOWN_ENCODINGS_FILE)
+            logger.info(f"Invalidated encoding cache file: '{settings.KNOWN_ENCODINGS_FILE}'")
+        except OSError as e:
+            logger.error(f"Failed to remove cache file: {e}")
 
 def load_known_faces_sync():
-    global current_known_face_encodings, current_known_faces_count
-    current_known_face_encodings = []
-    print(f"[Setup] กำลังโหลดใบหน้าที่รู้จักจาก '{SAVE_DIR}'...")
-    setup_save_directory()
-    for filename in os.listdir(SAVE_DIR):
+    if os.path.exists(settings.KNOWN_ENCODINGS_FILE):
+        logger.info(f"Loading encodings from cache: '{settings.KNOWN_ENCODINGS_FILE}'")
+        with open(settings.KNOWN_ENCODINGS_FILE, 'rb') as f:
+            app_state.known_face_encodings = pickle.load(f)
+        logger.info(f"Loaded {app_state.known_faces_count} known faces from cache.")
+        return
+
+    logger.info(f"No cache found. Loading faces from images in '{settings.SAVE_DIR}'")
+    if not os.path.exists(settings.SAVE_DIR):
+        os.makedirs(settings.SAVE_DIR)
+        logger.info(f"Created directory: '{settings.SAVE_DIR}'")
+
+    encodings = []
+    for filename in os.listdir(settings.SAVE_DIR):
         if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-            image_path = os.path.join(SAVE_DIR, filename)
+            image_path = os.path.join(settings.SAVE_DIR, filename)
             try:
                 image = face_recognition.load_image_file(image_path)
-                encodings = face_recognition.face_encodings(image)
-                if len(encodings) > 0:
-                    current_known_face_encodings.append(encodings[0])
+                face_encs = face_recognition.face_encodings(image)
+                if face_encs:
+                    encodings.append(face_encs[0])
                 else:
-                    print(f"[Setup] คำเตือน: ไม่พบใบหน้าใน {filename} ข้ามไป")
+                    logger.warning(f"No face found in {filename}, skipping.")
             except Exception as e:
-                print(f"[Setup] ข้อผิดพลาดในการโหลด {filename}: {e} ข้ามไป")
-    current_known_faces_count = len(current_known_face_encodings)
-    print(f"[Setup] โหลดใบหน้าที่รู้จักทั้งหมด: {current_known_faces_count}")
+                logger.error(f"Error loading {filename}: {e}, skipping.")
+    
+    app_state.known_face_encodings = encodings
+    
+    with open(settings.KNOWN_ENCODINGS_FILE, 'wb') as f:
+        pickle.dump(app_state.known_face_encodings, f)
+    
+    logger.info(f"Loaded and cached {app_state.known_faces_count} known faces.")
 
-# --- Background Detection Task (แก้ไขเพื่อเรียกใช้ฟังก์ชันบันทึก) ---
-async def _run_detection_loop(
-    camera_index: int,
-    stop_time_str: str = None,
-    run_duration_seconds: int = None
-):
-    global _camera_capture, current_frame_with_boxes
-    global current_known_face_encodings, current_known_faces_count
-    global current_last_saved_person_encoding, current_last_saved_person_cooldown_active, current_last_saved_person_seen_time
+# --- Background Detection Task ---
+async def _run_detection_loop(camera_index: int):
+    global _camera_capture
     
     _camera_capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not _camera_capture.isOpened():
-        print(f"[Camera] ข้อผิดพลาด: ไม่สามารถเปิดกล้องที่ดัชนี {camera_index}")
+        logger.error(f"Cannot open camera at index {camera_index}")
         return
-    print(f"[Service] กำลังเริ่มต้น Background face detection loop (กล้อง: {camera_index})...")
+
+    logger.info(f"Starting background detection loop on camera {camera_index}")
+    frame_counter = 0
+    last_processed_results: List[Tuple[tuple, str]] = []
 
     try:
         while not _stop_detection_flag.is_set():
@@ -112,150 +135,168 @@ async def _run_detection_loop(
             if not ret:
                 await asyncio.sleep(0.1)
                 continue
-            
-            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            
-            face_locations = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.face_locations, rgb_small_frame)
-            face_encodings = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.face_encodings, rgb_small_frame, face_locations)
-            
-            current_time = time.time()
-            last_saved_person_is_in_frame = False
-            
-            if len(face_encodings) > 0:
-                # [บันทึกภาพ] ใช้ enumerate เพื่อให้ได้ index มาจับคู่กับ face_locations
-                for i, face_encoding in enumerate(face_encodings):
-                    is_known_face = False
-                    if len(current_known_face_encodings) > 0:
-                        matches = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.compare_faces, current_known_face_encodings, face_encoding, DETECTION_THRESHOLD)
-                        if True in matches:
-                            is_known_face = True
-                    
-                    if current_last_saved_person_cooldown_active and current_last_saved_person_encoding is not None:
-                        is_last_saved_person_arr = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.compare_faces, [current_last_saved_person_encoding], face_encoding, DETECTION_THRESHOLD)
-                        if is_last_saved_person_arr[0]:
-                            last_saved_person_is_in_frame = True
-                            current_last_saved_person_seen_time = current_time
-                    
-                    if not is_known_face:
-                        if not current_last_saved_person_cooldown_active:
-                            current_known_face_encodings.append(face_encoding)
-                            current_known_faces_count += 1
-                            print(f"[Detection] ตรวจพบบุคคลใหม่ที่ไม่ซ้ำกัน! บุคคลทั้งหมด: {current_known_faces_count}")
-                            
-                            current_last_saved_person_encoding = face_encoding
-                            current_last_saved_person_cooldown_active = True
-                            current_last_saved_person_seen_time = current_time
-                            last_saved_person_is_in_frame = True
 
-                            # [บันทึกภาพ] เรียกใช้ฟังก์ชันบันทึกภาพตรงนี้
-                            # เราต้องใช้ตำแหน่งใบหน้าจาก face_locations ที่สอดคล้องกัน
-                            # และขยายตำแหน่งกลับไปเป็นขนาดของเฟรมเต็ม
-                            face_location_on_small_frame = face_locations[i]
-                            top, right, bottom, left = face_location_on_small_frame
-                            location_on_original_frame = (top * 2, right * 2, bottom * 2, left * 2)
-                            
-                            # เรียกใช้ฟังก์ชันบันทึกใน ThreadPoolExecutor เพื่อไม่ให้ block loop หลัก
-                            await asyncio.get_event_loop().run_in_executor(
-                                _executor,
-                                save_new_face,
-                                frame.copy(), # ส่งสำเนาของเฟรมเต็มไป
-                                location_on_original_frame
-                            )
+            frame_counter += 1
             
-            if current_last_saved_person_cooldown_active:
-                if not last_saved_person_is_in_frame:
-                    if current_time - current_last_saved_person_seen_time > COOLDOWN_TIMEOUT_IF_NOT_SEEN:
-                        print(f"[Detection] Cooldown หมดเวลา... พร้อมใช้งานอีกครั้ง")
-                        current_last_saved_person_cooldown_active = False
-                        current_last_saved_person_encoding = None
+            if frame_counter % settings.PROCESS_EVERY_N_FRAME == 0:
+                small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+                rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-            # ... (ส่วนวาดภาพและอัปเดต buffer เหมือนเดิม) ...
-            for (top, right, bottom, left) in face_locations:
-                top *= 2; right *= 2; bottom *= 2; left *= 2
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                face_locations = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.face_locations, rgb_small_frame)
+                face_encodings = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.face_encodings, rgb_small_frame, face_locations)
+
+                current_time = time.time()
+                processed_results_this_frame = []
+
+                expired_unknowns = [enc_tuple for enc_tuple, ts in app_state.recently_seen_unknowns.items() if current_time - ts > settings.RECENTLY_SEEN_TIMEOUT]
+                for enc_tuple in expired_unknowns:
+                    del app_state.recently_seen_unknowns[enc_tuple]
+
+                if face_encodings:
+                    for i, face_encoding in enumerate(face_encodings):
+                        face_status = "UNKNOWN"
+                        
+                        is_known_face = False
+                        if app_state.known_face_encodings:
+                            matches = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.compare_faces, app_state.known_face_encodings, face_encoding, settings.DETECTION_THRESHOLD)
+                            if True in matches:
+                                is_known_face = True
+                                face_status = "KNOWN"
+                        
+                        if not is_known_face:
+                            is_recently_seen = False
+                            if app_state.recently_seen_unknowns:
+                                recent_encodings = [np.array(e) for e in app_state.recently_seen_unknowns.keys()]
+                                matches = await asyncio.get_event_loop().run_in_executor(_executor, face_recognition.compare_faces, recent_encodings, face_encoding, settings.DETECTION_THRESHOLD)
+                                if True in matches:
+                                    is_recently_seen = True
+                                    face_status = "PENDING"
+                                    match_index = matches.index(True)
+                                    matched_encoding_tuple = tuple(recent_encodings[match_index])
+                                    app_state.recently_seen_unknowns[matched_encoding_tuple] = current_time
+
+                            if not is_recently_seen:
+                                face_status = "NEW"
+                                logger.info(f"Detected new unique face! Total saved: {app_state.known_faces_count + 1}")
+                                
+                                app_state.known_face_encodings.append(face_encoding)
+                                app_state.recently_seen_unknowns[tuple(face_encoding)] = current_time
+
+                                top, right, bottom, left = face_locations[i]
+                                orig_loc = (top * 2, right * 2, bottom * 2, left * 2)
+                                await asyncio.get_event_loop().run_in_executor(_executor, save_new_face, frame.copy(), orig_loc)
+                                _invalidate_encoding_cache()
+
+                        location_on_original = tuple(x * 2 for x in face_locations[i])
+                        processed_results_this_frame.append((location_on_original, face_status))
+                
+                last_processed_results = processed_results_this_frame
+
+            color_map = {"KNOWN": (255, 100, 100), "NEW": (0, 0, 255), "PENDING": (0, 255, 255), "UNKNOWN": (0, 255, 0)}
+            for (top, right, bottom, left), status in last_processed_results:
+                color = color_map.get(status, (255,255,255))
+                cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+                cv2.putText(frame, status, (left, bottom - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            cv2.putText(frame, f"Total Faces: {app_state.known_faces_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, f"Pending Unknowns: {len(app_state.recently_seen_unknowns)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             
-            status_text = f"Total Unique Faces: {current_known_faces_count}"
-            cooldown_status = "COOLDOWN ACTIVE" if current_last_saved_person_cooldown_active else "Ready to detect new"
-            cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, cooldown_status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
-            current_frame_with_boxes = frame.copy()
-            
+            app_state.frame_with_boxes = frame.copy()
             await asyncio.sleep(0.01)
             
     except asyncio.CancelledError:
-        print("[Service] Background detection task ถูกยกเลิก")
+        logger.info("Background detection task was cancelled.")
     finally:
         if _camera_capture and _camera_capture.isOpened():
             _camera_capture.release()
-            print("[Camera] กล้องถูกปล่อยแล้ว")
-        _executor.shutdown(wait=True)
-        print("[Service] Background detection loop หยุดทำงาน")
-
-# --- (ส่วนที่เหลือของไฟล์ตั้งแต่ generate_video_frames() ลงไปเหมือนเดิมทั้งหมด) ---
-
-# [สตรีมมิ่ง] ฟังก์ชัน Generator สำหรับสร้างเฟรมวิดีโอ
-async def generate_video_frames():
-    while not _stop_detection_flag.is_set():
-        if current_frame_with_boxes is None:
-            await asyncio.sleep(0.1)
-            continue
-        (flag, encodedImage) = cv2.imencode(".jpg", current_frame_with_boxes)
-        if not flag:
-            await asyncio.sleep(0.1)
-            continue
-        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
-        await asyncio.sleep(1/30)
+            logger.info("Camera released.")
 
 # --- FastAPI App ---
-app = FastAPI(title="Face Counting and Streaming Service")
-CAMERA_INDEX = 1
-SERVICE_STOP_TIME = None
-SERVICE_RUN_DURATION = None
+app = FastAPI(title="Advanced Face Detection Service")
 
 @app.on_event("startup")
 async def startup_event():
     global _detection_task
-    print("[App] แอปพลิเคชันเริ่มต้น...")
+    logger.info("Application startup...")
     load_known_faces_sync()
-    _detection_task = asyncio.create_task(
-        _run_detection_loop(camera_index=CAMERA_INDEX)
-    )
-    print("[App] Background detection task กำหนดเวลาแล้ว")
+    _detection_task = asyncio.create_task(_run_detection_loop(camera_index=settings.CAMERA_INDEX))
+    logger.info("Background detection task scheduled.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _detection_task, _stop_detection_flag
-    print("[App] แอปพลิเคชันกำลังปิด...")
+    global _detection_task
+    logger.info("Application shutdown...")
     if _detection_task and not _detection_task.done():
         _stop_detection_flag.set()
         _detection_task.cancel()
         try:
             await _detection_task
         except asyncio.CancelledError:
-            print("[App] Background task ถูกยกเลิกเรียบร้อย")
-    print("[App] แอปพลิเคชันปิดตัวลงสมบูรณ์")
+            logger.info("Background task cancelled successfully.")
+    _executor.shutdown(wait=True)
+    logger.info("Application shut down completely.")
 
-# --- API Endpoints ---
-@app.get("/", summary="หน้าหลักพร้อมวิดีโอสตรีม")
+async def generate_video_frames():
+    while not _stop_detection_flag.is_set():
+        if app_state.frame_with_boxes is None:
+            await asyncio.sleep(0.1)
+            continue
+        (flag, encodedImage) = cv2.imencode(".jpg", app_state.frame_with_boxes)
+        if not flag:
+            continue
+        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
+        await asyncio.sleep(1/30)
+
+@app.get("/", summary="Main page with video stream")
 async def main_page():
     html_content = """
-    <html><head><title>Face Detection Stream</title><style>body { font-family: sans-serif; background-color: #282c34; color: white; margin: 0; padding: 20px; text-align: center; } h1 { color: #61dafb; } #video-stream { border: 2px solid #61dafb; border-radius: 8px; max-width: 90%; height: auto; } .info { margin-top: 20px; font-size: 1.2em; }</style></head>
-    <body><h1>Live Face Detection Stream</h1><img id="video-stream" src="/video_feed" alt="Video Stream"><div class="info"><p>API Endpoints:</p><p><a href="/docs" target="_blank">/docs</a> - Interactive API Documentation</p><p><a href="/face_count" target="_blank">/face_count</a> - Get Current Unique Face Count</p></div></body></html>
+    <html><head><title>Face Detection Stream</title>
+    <style>body{font-family:sans-serif;background-color:#282c34;color:white;margin:0;padding:20px;text-align:center}h1{color:#61dafb}#video-stream{border:2px solid #61dafb;border-radius:8px;max-width:90%;height:auto}.info{margin-top:20px;font-size:1.2em}a{color:#61dafb}</style></head>
+    <body><h1>Live Face Detection Stream</h1><img id="video-stream" src="/video_feed" alt="Video Stream">
+    <div class="info"><p>API Endpoints:</p><p><a href="/docs" target="_blank">/docs</a> - API Docs</p><p><a href="/status" target="_blank">/status</a> - Get Status</p><p><a href="/faces" target="_blank">/faces</a> - List Faces</p></div></body></html>
     """
     return Response(content=html_content, media_type="text/html")
 
-@app.get("/face_count", response_model=int, summary="รับจำนวนใบหน้าที่ไม่ซ้ำกันในปัจจุบัน")
-async def get_face_count():
-    return current_known_faces_count
-
-@app.get("/status", summary="รับรายละเอียดสถานะการตรวจจับปัจจุบัน")
+@app.get("/status", summary="Get current detection status details")
 async def get_status():
-    return {"total_unique_faces_detected": current_known_faces_count, "cooldown_active": current_last_saved_person_cooldown_active}
+    return {
+        "total_unique_faces_saved": app_state.known_faces_count,
+        "pending_unknown_faces_in_memory": len(app_state.recently_seen_unknowns),
+        "processing_every_n_frame": settings.PROCESS_EVERY_N_FRAME,
+        "recently_seen_timeout_seconds": settings.RECENTLY_SEEN_TIMEOUT,
+    }
 
-@app.get("/video_feed", summary="สตรีมวิดีโอพร้อมแสดงผลการตรวจจับ")
+@app.get("/video_feed", summary="Stream video with detection overlays")
 async def video_feed():
     return StreamingResponse(generate_video_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/faces", summary="List all saved face image files")
+async def list_saved_faces():
+    if not os.path.exists(settings.SAVE_DIR):
+        return {"saved_faces": []}
+    return {"saved_faces": sorted(os.listdir(settings.SAVE_DIR))}
+
+@app.post("/faces/reload", summary="Force a reload of known faces from the directory")
+async def reload_faces():
+    _invalidate_encoding_cache()
+    await asyncio.get_event_loop().run_in_executor(None, load_known_faces_sync)
+    app_state.recently_seen_unknowns.clear()
+    return {"message": "Reloading known faces completed.", "count": app_state.known_faces_count}
+
+@app.delete("/faces/{filename}", summary="Delete a specific face file and update the database")
+async def delete_face(filename: str):
+    file_path = os.path.join(settings.SAVE_DIR, filename)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail=f"File '{filename}' not found.")
+    
+    os.remove(file_path)
+    logger.info(f"Deleted file: '{filename}'")
+    
+    _invalidate_encoding_cache()
+    await asyncio.get_event_loop().run_in_executor(None, load_known_faces_sync)
+    app_state.recently_seen_unknowns.clear()
+    
+    return {"message": f"'{filename}' deleted and faces reloaded.", "new_count": app_state.known_faces_count}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
